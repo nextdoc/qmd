@@ -17,6 +17,7 @@
   "files": [
     "bin/",
     "dist/",
+    "assets/",
     "LICENSE",
     "CHANGELOG.md"
   ],

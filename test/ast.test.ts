@@ -46,6 +46,12 @@ describe("detectLanguage", () => {
     expect(detectLanguage("src/auth.rs")).toBe("rust");
   });
 
+  test("recognizes Clojure extensions", () => {
+    expect(detectLanguage("src/core.clj")).toBe("clojure");
+    expect(detectLanguage("src/core.cljs")).toBe("clojure");
+    expect(detectLanguage("src/core.cljc")).toBe("clojure");
+  });
+
   test("returns null for markdown", () => {
     expect(detectLanguage("docs/README.md")).toBeNull();
   });
@@ -285,6 +291,87 @@ fn hash_password(password: &str) -> String {
     expect(structPoint?.score).toBe(100);
     expect(implPoint?.score).toBe(100);
     expect(traitPoint?.score).toBe(100);
+  });
+});
+
+// =============================================================================
+// AST Break Points - Clojure
+// =============================================================================
+
+describe("getASTBreakPoints - clojure", () => {
+  const CLJ_SAMPLE = `(ns myapp.auth
+  (:require [clojure.string :as str]
+            [myapp.db :as db]))
+
+(defn authenticate
+  "Check that token is valid for user."
+  [user token]
+  (let [session (db/find-session token)]
+    (= (:user-id session) (:id user))))
+
+(defn- hash-password
+  [password]
+  (some-hash password))
+
+(defmacro with-user
+  [user & body]
+  \`(binding [*current-user* ~user] ~@body))
+
+(defprotocol Authenticatable
+  (validate [this]))
+
+(defrecord BasicAuth [secret]
+  Authenticatable
+  (validate [this] (boolean (:secret this))))
+`;
+
+  test("produces break points for ns, defn, defmacro, defprotocol, and defrecord", async () => {
+    const points = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.clj");
+    const types = points.map(p => p.type);
+
+    expect(types.some(t => t.includes("mod"))).toBe(true);    // ns
+    expect(types.some(t => t.includes("func"))).toBe(true);   // defn, defn-, defmacro
+    expect(types.some(t => t.includes("class"))).toBe(true);  // defprotocol, defrecord
+  });
+
+  test("captures multiple defns", async () => {
+    const points = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.clj");
+    // authenticate, hash-password, defmacro with-user all surface as @func
+    const funcPoints = points.filter(p => p.type === "ast:func");
+    expect(funcPoints.length).toBeGreaterThanOrEqual(3);
+  });
+
+  test("ns scores 100, defn scores 90, defprotocol scores 100", async () => {
+    const points = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.clj");
+    const nsPoint = points.find(p => p.type === "ast:mod");
+    const funcPoint = points.find(p => p.type === "ast:func");
+    const classPoint = points.find(p => p.type === "ast:class");
+
+    expect(nsPoint?.score).toBe(100);
+    expect(funcPoint?.score).toBe(90);
+    expect(classPoint?.score).toBe(100);
+  });
+
+  test("break point positions match actual content positions", async () => {
+    const points = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.clj");
+    const nsPoint = points.find(p => p.type === "ast:mod");
+    expect(nsPoint).toBeDefined();
+    expect(CLJ_SAMPLE.slice(nsPoint!.pos, nsPoint!.pos + 3)).toBe("(ns");
+  });
+
+  test("works for .cljs and .cljc files", async () => {
+    const cljsPoints = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.cljs");
+    const cljcPoints = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.cljc");
+    expect(cljsPoints.length).toBeGreaterThan(0);
+    expect(cljcPoints.length).toBeGreaterThan(0);
+  });
+
+  test("query-local helper captures (underscore-prefixed) do not leak out", async () => {
+    // Clojure's query uses @_h as a helper for #match?/#eq? predicates.
+    // These should be filtered out so only real break points remain.
+    const points = await getASTBreakPoints(CLJ_SAMPLE, "src/auth.clj");
+    const leaked = points.filter(p => p.type.startsWith("ast:_"));
+    expect(leaked).toEqual([]);
   });
 });
 

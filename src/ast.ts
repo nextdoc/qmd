@@ -20,6 +20,7 @@
 
 import { createRequire } from "node:module";
 import { extname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { BreakPoint } from "./store.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
@@ -31,7 +32,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "clojure";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,6 +46,9 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".clj": "clojure",
+  ".cljs": "clojure",
+  ".cljc": "clojure",
 };
 
 /**
@@ -61,16 +65,25 @@ export function detectLanguage(filepath: string): SupportedLanguage | null {
 // =============================================================================
 
 /**
- * Maps language to the npm package and wasm filename for the grammar.
+ * Maps language to a grammar source. Two forms:
+ *  - { pkg, wasm }: resolve from an installed npm package
+ *  - { vendored }: load from a .wasm file vendored at assets/grammars/
  */
-const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
+type GrammarSource = { pkg: string; wasm: string } | { vendored: string };
+
+const GRAMMAR_MAP: Record<SupportedLanguage, GrammarSource> = {
   typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
   tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm" },
   javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm" },
   rust:       { pkg: "tree-sitter-rust",        wasm: "tree-sitter-rust.wasm" },
+  clojure:    { vendored: "tree-sitter-clojure.wasm" },
 };
+
+function grammarKey(entry: GrammarSource): string {
+  return "vendored" in entry ? entry.vendored : entry.wasm;
+}
 
 // =============================================================================
 // Per-Language Query Definitions
@@ -141,6 +154,20 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  clojure: `
+    ((list_lit
+      .
+      (sym_lit) @_h
+      (#eq? @_h "ns")) @mod)
+    ((list_lit
+      .
+      (sym_lit) @_h
+      (#match? @_h "^(defn|defn-|defmacro|defmulti|defmethod)$")) @func)
+    ((list_lit
+      .
+      (sym_lit) @_h
+      (#match? @_h "^(defprotocol|defrecord|deftype|definterface)$")) @class)
+  `,
 };
 
 /**
@@ -203,9 +230,12 @@ async function ensureInit(): Promise<void> {
  * Uses createRequire to resolve from installed dependency packages.
  */
 function resolveGrammarPath(language: SupportedLanguage): string {
-  const { pkg, wasm } = GRAMMAR_MAP[language];
+  const entry = GRAMMAR_MAP[language];
+  if ("vendored" in entry) {
+    return fileURLToPath(new URL(`../assets/grammars/${entry.vendored}`, import.meta.url));
+  }
   const require = createRequire(import.meta.url);
-  return require.resolve(`${pkg}/${wasm}`);
+  return require.resolve(`${entry.pkg}/${entry.wasm}`);
 }
 
 /**
@@ -215,7 +245,7 @@ function resolveGrammarPath(language: SupportedLanguage): string {
 async function loadGrammar(language: SupportedLanguage): Promise<LanguageType | null> {
   if (failedLanguages.has(language)) return null;
 
-  const wasmKey = GRAMMAR_MAP[language].wasm;
+  const wasmKey = grammarKey(GRAMMAR_MAP[language]);
   if (!grammarCache.has(wasmKey)) {
     grammarCache.set(wasmKey, (async () => {
       const path = resolveGrammarPath(language);
@@ -290,6 +320,10 @@ export async function getASTBreakPoints(
     const seen = new Map<number, BreakPoint>();
 
     for (const cap of captures) {
+      // Capture names starting with `_` are query-local helpers (used by
+      // #match?/#eq? predicates), not real break points — skip them.
+      if (cap.name.startsWith("_")) continue;
+
       const pos = cap.node.startIndex;
       const score = SCORE_MAP[cap.name] ?? 20;
       const type = `ast:${cap.name}`;
